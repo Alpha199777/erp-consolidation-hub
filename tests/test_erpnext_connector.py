@@ -25,16 +25,32 @@ def rec(i, **kw):
     return base
 
 
-def make_fake_get(records):
-    """Simule l'API : découpe `records` en pages via limit_start / limit_page_length."""
+def make_fake_get(records, addresses=None, details=None):
+    """Simule l'API ERPNext.
+
+    - /api/resource/Customer : `records`, découpés en pages (limit_start / limit_page_length)
+    - /api/resource/Address : `addresses` (vide par défaut), même pagination
+    - /api/resource/Address/<nom> : `details[nom]`
+    """
+    addresses = addresses or []
+    details = details or {}
     calls = []
 
     def fake_get(url, headers=None, params=None, timeout=None):
         calls.append({"url": url, "headers": headers, "params": params})
+        if "/api/resource/Address/" in url:
+            nom = url.split("/api/resource/Address/", 1)[1].replace("%20", " ")
+            return FakeResponse(200, {"data": details[nom]})
+        source = addresses if url.endswith("/api/resource/Address") else records
         start, size = params["limit_start"], params["limit_page_length"]
-        return FakeResponse(200, {"data": records[start:start + size]})
+        return FakeResponse(200, {"data": source[start:start + size]})
 
     return fake_get, calls
+
+
+def customer_calls(calls):
+    """Appels de pagination sur les clients (les appels Address sont exclus)."""
+    return [c for c in calls if c["url"].endswith("/api/resource/Customer")]
 
 
 def connector(page_size=100):
@@ -101,14 +117,14 @@ def test_fetch_paginates_with_partial_last_page(monkeypatch):
     fake, calls = make_fake_get([rec(i) for i in range(5)])
     monkeypatch.setattr("hub.connectors.erpnext.requests.get", fake)
     assert len(connector(page_size=2).fetch_customers()) == 5
-    assert len(calls) == 3
+    assert len(customer_calls(calls)) == 3
 
 
 def test_fetch_paginates_until_empty_page(monkeypatch):
     fake, calls = make_fake_get([rec(i) for i in range(4)])
     monkeypatch.setattr("hub.connectors.erpnext.requests.get", fake)
     assert len(connector(page_size=2).fetch_customers()) == 4
-    assert len(calls) == 3  # la 3e page est vide
+    assert len(customer_calls(calls)) == 3  # la 3e page est vide
 
 
 def test_fetch_empty_returns_empty_list(monkeypatch):
@@ -117,11 +133,16 @@ def test_fetch_empty_returns_empty_list(monkeypatch):
     assert connector().fetch_customers() == []
 
 
-def test_fetch_sends_token_header(monkeypatch):
-    fake, calls = make_fake_get([rec(1)])
+def test_fetch_sends_token_header_on_every_call(monkeypatch):
+    fake, calls = make_fake_get(
+        [rec(1, name="C1")],
+        addresses=[{"name": "A1", "disabled": 0, "is_your_company_address": 0}],
+        details={"A1": {"name": "A1", "links": []}},
+    )
     monkeypatch.setattr("hub.connectors.erpnext.requests.get", fake)
     connector().fetch_customers()
-    assert calls[0]["headers"]["Authorization"] == "token key:secret"
+    assert len(calls) >= 3  # clients, liste des adresses, détail d'une adresse
+    assert all(c["headers"]["Authorization"] == "token key:secret" for c in calls)
 
 
 def test_fetch_raises_on_unauthorized(monkeypatch):
@@ -129,6 +150,27 @@ def test_fetch_raises_on_unauthorized(monkeypatch):
                         lambda *a, **k: FakeResponse(401))
     with pytest.raises(requests.HTTPError):
         connector().fetch_customers()
+
+
+def test_fetch_without_address_reads_no_address_detail(monkeypatch):
+    fake, calls = make_fake_get([rec(1), rec(2)])
+    monkeypatch.setattr("hub.connectors.erpnext.requests.get", fake)
+    records = connector().fetch_customers()
+    assert all("_address" not in r for r in records)
+    assert not any("/api/resource/Address/" in c["url"] for c in calls)
+
+
+def test_fetch_adds_the_linked_address_to_the_customer(monkeypatch):
+    fake, _ = make_fake_get(
+        [rec(1, name="C1")],
+        addresses=[{"name": "A1", "disabled": 0, "is_your_company_address": 0}],
+        details={"A1": {"name": "A1", "city": "Zurich", "pincode": "8001",
+                        "country": "Switzerland",
+                        "links": [{"link_doctype": "Customer", "link_name": "C1"}]}},
+    )
+    monkeypatch.setattr("hub.connectors.erpnext.requests.get", fake)
+    records = connector().fetch_customers()
+    assert records[0]["_address"]["city"] == "Zurich"
 
 
 # --- ping ---------------------------------------------------------------

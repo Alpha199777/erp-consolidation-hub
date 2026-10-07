@@ -2,7 +2,8 @@
 
 Même contrat que les autres connecteurs : ping(), fetch_*(), normalize*().
 Ville, code postal et pays ne sont pas sur le Customer : ils sont dans le
-doctype Address (enrichissement prévu au sprint 2).
+doctype Address, relié au client par une table enfant (links). fetch_customers()
+enrichit chaque client avec l'adresse retenue (voir choose_address).
 """
 from __future__ import annotations
 
@@ -27,6 +28,35 @@ ENV_KEYS = ("ERPNEXT_URL", "ERPNEXT_API_KEY", "ERPNEXT_API_SECRET")
 
 DEFAULT_PAGE_SIZE = 100
 TIMEOUT = 15
+
+
+def choose_address(addresses: list[dict], primary_name: str | None = None) -> dict | None:
+    """Choisit l'adresse d'un client parmi toutes celles qui lui sont liées.
+
+    On écarte les adresses désactivées et celles de la société elle-même, puis
+    on garde la première selon cet ordre :
+      1. l'adresse déclarée sur le client (customer_primary_address) ;
+      2. l'adresse marquée principale (is_primary_address) ;
+      3. l'adresse de type Billing ;
+      4. à égalité, le nom le plus petit (résultat toujours le même).
+    Le nom d'une adresse ne dit rien de son type : on lit address_type.
+    """
+    candidates = [
+        a for a in addresses
+        if not a.get("disabled") and not a.get("is_your_company_address")
+    ]
+    if not candidates:
+        return None
+
+    def rank(address: dict):
+        return (
+            0 if primary_name and address.get("name") == primary_name else 1,
+            0 if address.get("is_primary_address") else 1,
+            0 if address.get("address_type") == "Billing" else 1,
+            str(address.get("name")),
+        )
+
+    return min(candidates, key=rank)
 
 
 class ERPNextConnector:
@@ -67,35 +97,55 @@ class ERPNextConnector:
             return False
 
     def fetch_customers(self) -> list[dict]:
-        """Retourne tous les enregistrements bruts Customer (actifs ou non)."""
-        records: list[dict] = []
-        start = 0
-        while True:
-            r = self._get(
-                "/api/resource/Customer",
-                fields=json.dumps(["*"]),
-                limit_start=start,
-                limit_page_length=self.page_size,
-                order_by="name asc",
+        """Retourne tous les Customer bruts (actifs ou non), enrichis de leur adresse.
+
+        L'adresse retenue est ajoutée sous la clé '_address' (enregistrement brut
+        de l'Address). Un client sans adresse n'a pas cette clé.
+        Une erreur de lecture des adresses remonte : mieux vaut un run en échec
+        tracé qu'une ville vide sans explication.
+        """
+        records = self._list("Customer")
+        addresses = self.fetch_addresses_by_customer()
+        for record in records:
+            chosen = choose_address(
+                addresses.get(str(record["name"]), []),
+                clean(record.get("customer_primary_address")),
             )
-            r.raise_for_status()
-            batch = r.json()["data"]
-            records.extend(batch)
-            if len(batch) < self.page_size:
-                break
-            start += self.page_size
+            if chosen is not None:
+                record["_address"] = chosen
         return records
 
+    def fetch_addresses_by_customer(self) -> dict[str, list[dict]]:
+        """Adresses regroupées par nom de client.
+
+        La liste /api/resource/Address ne contient pas la table enfant 'links' :
+        on lit chaque adresse seule. Les adresses désactivées et celles de la
+        société sont écartées avant cette lecture (un appel de moins chacune).
+        """
+        by_customer: dict[str, list[dict]] = {}
+        for brut in self._list("Address"):
+            if brut.get("disabled") or brut.get("is_your_company_address"):
+                continue
+            name = str(brut["name"])
+            response = self._get(f"/api/resource/{quote('Address')}/{quote(name)}")
+            response.raise_for_status()
+            detail = response.json().get("data", {})
+            for link in detail.get("links") or []:
+                if link.get("link_doctype") == "Customer":
+                    by_customer.setdefault(str(link.get("link_name")), []).append(detail)
+        return by_customer
+
     def normalize(self, record: dict) -> Customer:
+        address = record.get("_address") or {}
         return Customer(
             source=self.source,
             source_id=str(record["name"]),
             name=clean(record.get("customer_name")),
             email=clean(record.get("email_id")),
             phone=clean(record.get("mobile_no")),
-            city=None,
-            postal_code=None,
-            country=None,
+            city=clean(address.get("city")),
+            postal_code=clean(address.get("pincode")),
+            country=clean(address.get("country")),
             payload=record,
         )
 

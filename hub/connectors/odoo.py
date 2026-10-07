@@ -4,7 +4,7 @@ Contrat commun aux connecteurs :
   - ping()
   - fetch_customers() / normalize()
   - fetch_invoices() / normalize_invoice()
-  - fetch_invoice_lines() / normalize_invoice_line()
+  - fetch_invoice_lines(invoices=None) / normalize_invoice_line()
   - fetch_items() / normalize_item()
 """
 import os
@@ -150,8 +150,12 @@ class OdooConnector:
         )
 
     # ---------- Lignes de facture ----------
-    def fetch_invoice_lines(self) -> list[dict]:
-        """Lignes produit des factures et avoirs clients."""
+    def fetch_invoice_lines(self, invoices: list[dict] | None = None) -> list[dict]:
+        """Lignes produit des factures et avoirs clients.
+
+        `invoices` est accepte pour respecter le contrat commun des connecteurs,
+        mais Odoo lit toutes les lignes en un seul appel : le parametre est ignore.
+        """
         domain = [
             ["move_id.move_type", "in", MOVE_TYPES],
             ["display_type", "=", "product"],

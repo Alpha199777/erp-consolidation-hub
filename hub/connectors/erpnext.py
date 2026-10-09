@@ -1,14 +1,27 @@
 """Connecteur ERPNext : lit clients, factures, lignes et articles via l'API REST de Frappe.
 
-Même contrat que les autres connecteurs : ping(), fetch_*(), normalize*().
+Contrat commun aux connecteurs :
+  - ping()
+  - fetch_customers(since=None) / normalize()
+  - fetch_invoices(since=None) / normalize_invoice()
+  - fetch_invoice_lines(invoices=None) / normalize_invoice_line()
+  - fetch_items(since=None) / normalize_item()
+  - record_modified_at(record) : date de modification d'un enregistrement brut
+  - overlap : marge relue avant le point de reprise (synchronisation incrementale)
+
 Ville, code postal et pays ne sont pas sur le Customer : ils sont dans le
-doctype Address, relié au client par une table enfant (links). fetch_customers()
+doctype Address, relie au client par une table enfant (links). fetch_customers()
 enrichit chaque client avec l'adresse retenue (voir choose_address).
+
+`since` : sans lui, lecture complete ; avec lui, seulement les enregistrements dont
+`modified` est egal ou posterieur. Un client dont seule l'adresse a change est
+relu aussi (son `modified` n'a pas bouge).
 """
 from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import requests
@@ -28,6 +41,24 @@ ENV_KEYS = ("ERPNEXT_URL", "ERPNEXT_API_KEY", "ERPNEXT_API_SECRET")
 
 DEFAULT_PAGE_SIZE = 100
 TIMEOUT = 15
+
+
+def _utc(value: datetime) -> datetime:
+    """Instant avec fuseau UTC (un instant sans fuseau est lu comme UTC)."""
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc)
+    return value.replace(tzinfo=timezone.utc)
+
+
+def _erpnext_datetime(since: datetime) -> str:
+    """Instant -> texte du champ `modified` d'ERPNext (UTC, avec microsecondes)."""
+    return _utc(since).strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
+def _newest_modified(values: list) -> str | None:
+    """Plus recente des dates de modification (texte d'origine), ou None."""
+    dated = [(to_datetime(v), v) for v in values if clean(v) is not None]
+    return max(dated, key=lambda pair: pair[0])[1] if dated else None
 
 
 def choose_address(addresses: list[dict], primary_name: str | None = None) -> dict | None:
@@ -61,6 +92,9 @@ def choose_address(addresses: list[dict], primary_name: str | None = None) -> di
 
 class ERPNextConnector:
     source = "erpnext"
+    # Marge relue avant le point de reprise : couvre les ecritures tardives et le
+    # fuseau du serveur (non verifie, lu comme UTC).
+    overlap = timedelta(minutes=5)
 
     def __init__(self, url: str, api_key: str, api_secret: str,
                  page_size: int = DEFAULT_PAGE_SIZE):
@@ -96,24 +130,66 @@ class ERPNextConnector:
         except requests.RequestException:
             return False
 
-    def fetch_customers(self) -> list[dict]:
-        """Retourne tous les Customer bruts (actifs ou non), enrichis de leur adresse.
+    def record_modified_at(self, record: dict) -> datetime | None:
+        """Date de derniere modification d'un enregistrement brut.
+
+        Pour un client dont l'adresse a change plus tard, `_modified_max` (ajoute par
+        fetch_customers) l'emporte sur `modified`.
+        """
+        return to_datetime(record.get("_modified_max") or record.get("modified"))
+
+    # ---------- Clients ----------
+    def fetch_customers(self, since: datetime | None = None) -> list[dict]:
+        """Retourne les Customer bruts (actifs ou non), enrichis de leur adresse.
 
         L'adresse retenue est ajoutée sous la clé '_address' (enregistrement brut
         de l'Address). Un client sans adresse n'a pas cette clé.
+        Avec `since` : les clients modifies depuis cette date, plus ceux dont une
+        adresse a ete modifiee depuis cette date.
         Une erreur de lecture des adresses remonte : mieux vaut un run en échec
         tracé qu'une ville vide sans explication.
         """
-        records = self._list("Customer")
+        if since is None:
+            records = self._list("Customer")
+        else:
+            records = self._list("Customer", since=since)
         addresses = self.fetch_addresses_by_customer()
+        if since is not None:
+            records = records + self._customers_with_recent_address(records, addresses, since)
         for record in records:
-            chosen = choose_address(
-                addresses.get(str(record["name"]), []),
-                clean(record.get("customer_primary_address")),
-            )
+            linked = addresses.get(str(record["name"]), [])
+            chosen = choose_address(linked, clean(record.get("customer_primary_address")))
             if chosen is not None:
                 record["_address"] = chosen
+            newest = _newest_modified(
+                [record.get("modified")] + [a.get("modified") for a in linked]
+            )
+            if newest is not None and newest != record.get("modified"):
+                record["_modified_max"] = newest
         return records
+
+    def _customers_with_recent_address(
+        self, records: list[dict], addresses: dict[str, list[dict]], since: datetime
+    ) -> list[dict]:
+        """Clients absents de `records` mais dont une adresse a change depuis `since`."""
+        known = {str(r["name"]) for r in records}
+        limit = _utc(since)
+        extra: list[dict] = []
+        for name, linked in addresses.items():
+            if name in known:
+                continue
+            if not any(
+                (to_datetime(a.get("modified")) or datetime.min.replace(tzinfo=timezone.utc))
+                >= limit
+                for a in linked
+            ):
+                continue
+            response = self._get(f"/api/resource/{quote('Customer')}/{quote(name)}")
+            if response.status_code == 404:  # adresse liee a un client disparu : on ignore
+                continue
+            response.raise_for_status()
+            extra.append(response.json().get("data", {}))
+        return extra
 
     def fetch_addresses_by_customer(self) -> dict[str, list[dict]]:
         """Adresses regroupées par nom de client.
@@ -151,18 +227,23 @@ class ERPNextConnector:
 
     # ---------- Sprint 2 : factures, lignes, articles ----------
 
-    def _list(self, doctype: str) -> list[dict]:
-        """Pagine /api/resource/<doctype> (nom du doctype URL-encodé)."""
+    def _list(self, doctype: str, since: datetime | None = None) -> list[dict]:
+        """Pagine /api/resource/<doctype> (nom du doctype URL-encodé).
+
+        Avec `since` : filtre serveur `modified >= since` envoye a chaque page.
+        """
         records: list[dict] = []
         start = 0
         while True:
-            response = self._get(
-                f"/api/resource/{quote(doctype)}",
-                fields=json.dumps(["*"]),
-                limit_start=start,
-                limit_page_length=self.page_size,
-                order_by="name asc",
-            )
+            params = {
+                "fields": json.dumps(["*"]),
+                "limit_start": start,
+                "limit_page_length": self.page_size,
+                "order_by": "name asc",
+            }
+            if since is not None:
+                params["filters"] = json.dumps([["modified", ">=", _erpnext_datetime(since)]])
+            response = self._get(f"/api/resource/{quote(doctype)}", **params)
             response.raise_for_status()
             batch = response.json().get("data", [])
             records.extend(batch)
@@ -170,8 +251,10 @@ class ERPNextConnector:
                 return records
             start += self.page_size
 
-    def fetch_invoices(self) -> list[dict]:
-        return self._list("Sales Invoice")
+    def fetch_invoices(self, since: datetime | None = None) -> list[dict]:
+        if since is None:
+            return self._list("Sales Invoice")
+        return self._list("Sales Invoice", since=since)
 
     def normalize_invoice(self, record: dict) -> Invoice:
         return Invoice(
@@ -224,8 +307,10 @@ class ERPNextConnector:
             payload=record,
         )
 
-    def fetch_items(self) -> list[dict]:
-        return self._list("Item")
+    def fetch_items(self, since: datetime | None = None) -> list[dict]:
+        if since is None:
+            return self._list("Item")
+        return self._list("Item", since=since)
 
     def normalize_item(self, record: dict) -> Item:
         return Item(

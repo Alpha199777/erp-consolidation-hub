@@ -28,16 +28,18 @@ def _result(source: str, echec: bool) -> load.SyncResult:
 @pytest.fixture
 def etat(monkeypatch):
     """Remplace connect() et les synchronisations par des enregistreurs."""
-    state = {"appels": [], "echecs": set(), "conn": FakeConn()}
+    state = {"appels": [], "modes": [], "echecs": set(), "conn": FakeConn()}
 
     monkeypatch.setattr(load, "connect", lambda: state["conn"])
 
-    def fake_sync_source(conn, connector, entity="customers"):
+    def fake_sync_source(conn, connector, entity="customers", mode="none"):
         state["appels"].append((connector.source, entity))
+        state["modes"].append(mode)
         return _result(connector.source, (connector.source, entity) in state["echecs"])
 
-    def fake_sync_invoices(conn, connector):
+    def fake_sync_invoices(conn, connector, mode="none"):
         state["appels"].append((connector.source, "invoices"))
+        state["modes"].append(mode)
         echec = (connector.source, "invoices") in state["echecs"]
         return (_result(connector.source, echec), _result(connector.source, echec))
 
@@ -64,7 +66,7 @@ def test_un_echec_nempeche_pas_les_autres_entites(etat):
 
 
 def test_connexion_fermee_meme_en_cas_derreur_inattendue(etat, monkeypatch):
-    def boom(conn, connector, entity="customers"):
+    def boom(conn, connector, entity="customers", mode="none"):
         raise RuntimeError("erreur inattendue")
 
     monkeypatch.setattr(load, "sync_source", boom)
@@ -91,6 +93,26 @@ def test_check_only_necrit_rien(monkeypatch):
 
     monkeypatch.setattr(load, "connect", interdit)
     assert run_sprint2.main(["--check-only"]) == 0
+
+
+def test_mode_transmis_a_toutes_les_synchronisations(etat):
+    run_sprint2.run_sync([FakeConnector("odoo")], mode="full")
+    assert etat["modes"] == ["full", "full", "full"]
+
+
+@pytest.mark.parametrize(
+    "argv, mode_attendu",
+    [([], "incremental"), (["--full"], "full")],
+)
+def test_main_choisit_le_mode(monkeypatch, argv, mode_attendu):
+    vus = []
+    monkeypatch.setattr(run_sprint2, "load_dotenv", lambda: None)
+    monkeypatch.setattr(
+        run_sprint2, "build_connectors", lambda: ([FakeConnector("odoo")], [])
+    )
+    monkeypatch.setattr(run_sprint2, "run_sync", lambda connectors, mode: vus.append(mode) or 0)
+    assert run_sprint2.main(argv) == 0
+    assert vus == [mode_attendu]
 
 
 def test_entites_du_sprint2():

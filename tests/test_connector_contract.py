@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+from datetime import timedelta
 
 import pytest
 
@@ -25,6 +26,7 @@ METHODES = [
     "normalize_invoice_line",
     "fetch_items",
     "normalize_item",
+    "record_modified_at",
 ]
 
 LECTURES_SANS_ARGUMENT = ["fetch_customers", "fetch_invoices", "fetch_items"]
@@ -34,6 +36,7 @@ NORMALISATIONS = [
     "normalize_invoice",
     "normalize_invoice_line",
     "normalize_item",
+    "record_modified_at",
 ]
 
 
@@ -89,3 +92,27 @@ def test_normalisations_prennent_un_record(nom_module):
     for name in NORMALISATIONS:
         params = _parametres_obligatoires(getattr(cls, name))
         assert params == ["record"], f"{name} : {params}"
+
+
+@pytest.mark.parametrize("nom_module", MODULES)
+def test_lectures_acceptent_since_optionnel(nom_module):
+    """Synchronisation incrementale : since=None = lecture complete."""
+    cls = _classe_connecteur(nom_module)
+    for name in LECTURES_SANS_ARGUMENT:
+        parametres = inspect.signature(getattr(cls, name)).parameters
+        assert "since" in parametres, f"{nom_module}.{name} : parametre 'since' absent"
+        assert parametres["since"].default is None, f"{nom_module}.{name} : since doit valoir None par defaut"
+
+
+@pytest.mark.parametrize("nom_module", MODULES)
+def test_marge_de_recouvrement_positive(nom_module):
+    cls = _classe_connecteur(nom_module)
+    assert isinstance(cls.overlap, timedelta), f"{nom_module} : overlap doit etre un timedelta"
+    assert cls.overlap > timedelta(0), f"{nom_module} : overlap doit etre positif"
+
+
+@pytest.mark.parametrize("nom_module", MODULES)
+def test_record_modified_at_tolere_un_enregistrement_vide(nom_module):
+    cls = _classe_connecteur(nom_module)
+    connecteur = cls.__new__(cls)  # sans __init__ : ni reseau, ni variables .env
+    assert connecteur.record_modified_at({}) is None

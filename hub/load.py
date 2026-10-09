@@ -1,13 +1,25 @@
-"""Chargement dans PostgreSQL : upsert idempotent + journal des synchronisations."""
+"""Chargement dans PostgreSQL : upsert idempotent + journal des synchronisations.
+
+Trois modes de lecture (parametre `mode`) :
+  - "none"        : lecture complete, sans point de reprise (comportement historique) ;
+  - "incremental" : lecture depuis le point de reprise de raw.sync_state, moins la marge
+                    de recouvrement du connecteur ; sans point de reprise, lecture complete ;
+  - "full"        : lecture complete, quel que soit l'etat.
+Avec "incremental" et "full", le point de reprise est ecrit dans la MEME transaction que
+les donnees : s'il y a un echec, ni l'un ni l'autre n'avance.
+"""
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime
 
 import psycopg
 from psycopg.types.json import Jsonb
 
 from hub.models import Customer, Invoice, InvoiceLine, Item
+
+MODES = ("none", "incremental", "full")
 
 UPSERT_CUSTOMER = """
 INSERT INTO raw.customers
@@ -80,6 +92,19 @@ ON CONFLICT (source, source_id) DO UPDATE SET
     last_synced_at = now()
 """
 
+# Le point de reprise ne recule jamais (GREATEST ignore les NULL) et la date du
+# dernier rechargement complet n'est ecrasee que par un nouveau rechargement complet.
+UPSERT_STATE = """
+INSERT INTO raw.sync_state
+    (source, entity, watermark, last_full_sync_at, last_run_id, updated_at)
+VALUES (%s, %s, %s::timestamptz, CASE WHEN %s::boolean THEN now() END, %s::bigint, now())
+ON CONFLICT (source, entity) DO UPDATE SET
+    watermark = GREATEST(raw.sync_state.watermark, EXCLUDED.watermark),
+    last_full_sync_at = COALESCE(EXCLUDED.last_full_sync_at, raw.sync_state.last_full_sync_at),
+    last_run_id = EXCLUDED.last_run_id,
+    updated_at = now()
+"""
+
 
 @dataclass
 class SyncResult:
@@ -89,6 +114,7 @@ class SyncResult:
     rows_fetched: int
     rows_loaded: int
     error: str | None = None
+    since: datetime | None = None  # None = lecture complete
 
 
 def connect() -> psycopg.Connection:
@@ -173,22 +199,73 @@ def finish_run(conn: psycopg.Connection, run_id: int, status: str,
     )
 
 
+def get_watermark(conn: psycopg.Connection, source: str, entity: str) -> datetime | None:
+    """Point de reprise d'un ERP pour une entité (None s'il n'y en a pas encore)."""
+    row = conn.execute(
+        "SELECT watermark FROM raw.sync_state WHERE source = %s AND entity = %s",
+        (source, entity),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def save_state(conn: psycopg.Connection, source: str, entity: str,
+               newest: datetime | None, run_id: int, full_read: bool) -> None:
+    """Écrit le point de reprise (sans jamais le faire reculer).
+
+    `newest` : plus grande date de modification vue dans cette lecture (None si rien).
+    `full_read` : vrai si la lecture était complète (met à jour last_full_sync_at).
+    À appeler DANS la transaction qui charge les données.
+    """
+    conn.execute(UPSERT_STATE, (source, entity, newest, full_read, run_id))
+
+
 def _error_message(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"[:500]
 
 
-def sync_invoices(conn: psycopg.Connection, connector) -> tuple[SyncResult, SyncResult]:
+def _check_mode(mode: str) -> None:
+    if mode not in MODES:
+        raise ValueError(f"Mode inconnu : {mode!r} (attendu : {MODES})")
+
+
+def _fetch(method, since: datetime | None):
+    """Appelle fetch_*() ; l'argument `since` n'est transmis que s'il existe."""
+    return method() if since is None else method(since=since)
+
+
+def _since_for(conn: psycopg.Connection, connector, entity: str, mode: str) -> datetime | None:
+    """Date de départ de la lecture : point de reprise moins la marge, ou None (tout lire)."""
+    if mode != "incremental":
+        return None
+    watermark = get_watermark(conn, connector.source, entity)
+    if watermark is None:
+        return None
+    return watermark - connector.overlap
+
+
+def _newest(connector, records: list[dict]) -> datetime | None:
+    """Plus grande date de modification des enregistrements bruts (None si aucune)."""
+    dates = [d for d in (connector.record_modified_at(r) for r in records) if d is not None]
+    return max(dates) if dates else None
+
+
+def sync_invoices(conn: psycopg.Connection, connector,
+                  mode: str = "none") -> tuple[SyncResult, SyncResult]:
     """Synchronise factures ET lignes d'un ERP dans une seule transaction.
 
     Deux lignes de journal (invoices, invoice_lines), un seul bloc atomique :
-    une ligne de facture n'existe jamais sans sa facture.
+    une ligne de facture n'existe jamais sans sa facture. Le point de reprise
+    (entité 'invoices') est écrit dans ce même bloc.
     """
+    _check_mode(mode)
     run_inv = start_run(conn, connector.source, "invoices")
     run_lin = start_run(conn, connector.source, "invoice_lines")
     n_inv = 0
     n_lin = 0
+    since = None
     try:
-        raw_invoices = connector.fetch_invoices()
+        since = _since_for(conn, connector, "invoices", mode)
+        raw_invoices = _fetch(connector.fetch_invoices, since)
         n_inv = len(raw_invoices)
         raw_lines = connector.fetch_invoice_lines(raw_invoices)
         n_lin = len(raw_lines)
@@ -197,49 +274,65 @@ def sync_invoices(conn: psycopg.Connection, connector) -> tuple[SyncResult, Sync
         with conn.transaction():
             loaded_inv = upsert_invoices(conn, invoices)
             loaded_lin = upsert_invoice_lines(conn, lines)
+            if mode != "none":
+                save_state(conn, connector.source, "invoices",
+                           _newest(connector, raw_invoices), run_inv,
+                           full_read=since is None)
     except Exception as exc:  # noqa: BLE001 - on trace toute erreur d'un ERP
         message = _error_message(exc)
         finish_run(conn, run_inv, "failed", n_inv, 0, message)
         finish_run(conn, run_lin, "failed", n_lin, 0, message)
         return (
-            SyncResult(connector.source, run_inv, "failed", n_inv, 0, message),
-            SyncResult(connector.source, run_lin, "failed", n_lin, 0, message),
+            SyncResult(connector.source, run_inv, "failed", n_inv, 0, message, since=since),
+            SyncResult(connector.source, run_lin, "failed", n_lin, 0, message, since=since),
         )
     finish_run(conn, run_inv, "success", n_inv, loaded_inv)
     finish_run(conn, run_lin, "success", n_lin, loaded_lin)
     return (
-        SyncResult(connector.source, run_inv, "success", n_inv, loaded_inv),
-        SyncResult(connector.source, run_lin, "success", n_lin, loaded_lin),
+        SyncResult(connector.source, run_inv, "success", n_inv, loaded_inv, since=since),
+        SyncResult(connector.source, run_lin, "success", n_lin, loaded_lin, since=since),
     )
 
 
-def sync_source(conn: psycopg.Connection, connector, entity: str = "customers") -> SyncResult:
+def sync_source(conn: psycopg.Connection, connector, entity: str = "customers",
+                mode: str = "none") -> SyncResult:
     """Synchronise une entité d'un ERP. Ne lève pas d'exception : l'échec est tracé.
 
     Entités : customers, items, invoices (invoices charge aussi les lignes ;
     pour obtenir les deux résultats, appeler sync_invoices directement).
     """
     if entity == "invoices":
-        return sync_invoices(conn, connector)[0]
+        return sync_invoices(conn, connector, mode)[0]
     if entity not in ("customers", "items"):
         raise ValueError(f"Entité inconnue : {entity!r}")
+    _check_mode(mode)
 
     run_id = start_run(conn, connector.source, entity)
     fetched = 0
+    since = None
     try:
+        since = _since_for(conn, connector, entity, mode)
         if entity == "customers":
-            records = connector.fetch_customers()
+            records = _fetch(connector.fetch_customers, since)
             fetched = len(records)
             objects = [connector.normalize(r) for r in records]
-            loaded = upsert_customers(conn, objects)
+            upsert = upsert_customers
         else:
-            records = connector.fetch_items()
+            records = _fetch(connector.fetch_items, since)
             fetched = len(records)
             objects = [connector.normalize_item(r) for r in records]
-            loaded = upsert_items(conn, objects)
+            upsert = upsert_items
+        if mode == "none":
+            loaded = upsert(conn, objects)
+        else:
+            with conn.transaction():
+                loaded = upsert(conn, objects)
+                save_state(conn, connector.source, entity,
+                           _newest(connector, records), run_id,
+                           full_read=since is None)
     except Exception as exc:  # noqa: BLE001 - on trace toute erreur d'un ERP
         message = _error_message(exc)
         finish_run(conn, run_id, "failed", fetched, 0, message)
-        return SyncResult(connector.source, run_id, "failed", fetched, 0, message)
+        return SyncResult(connector.source, run_id, "failed", fetched, 0, message, since=since)
     finish_run(conn, run_id, "success", fetched, loaded)
-    return SyncResult(connector.source, run_id, "success", fetched, loaded)
+    return SyncResult(connector.source, run_id, "success", fetched, loaded, since=since)

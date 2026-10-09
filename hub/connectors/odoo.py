@@ -2,13 +2,19 @@
 
 Contrat commun aux connecteurs :
   - ping()
-  - fetch_customers() / normalize()
-  - fetch_invoices() / normalize_invoice()
+  - fetch_customers(since=None) / normalize()
+  - fetch_invoices(since=None) / normalize_invoice()
   - fetch_invoice_lines(invoices=None) / normalize_invoice_line()
-  - fetch_items() / normalize_item()
+  - fetch_items(since=None) / normalize_item()
+  - record_modified_at(record) : date de modification d'un enregistrement brut
+  - overlap : marge relue avant le point de reprise (synchronisation incrementale)
+
+`since` : sans lui, lecture complete ; avec lui, seulement les enregistrements
+modifies a cette date ou apres (comparaison >=, jamais >).
 """
 import os
 import xmlrpc.client
+from datetime import datetime, timedelta, timezone
 
 from hub.models import (
     Customer,
@@ -61,8 +67,29 @@ def _invoice_status(record: dict) -> str | None:
     return f"{state}/{payment}" if state and payment else state
 
 
+def _odoo_datetime(value: datetime) -> str:
+    """Instant -> texte attendu par Odoo : UTC, sans fuseau, a la seconde.
+
+    Un instant sans fuseau est lu comme UTC (meme hypothese que to_datetime).
+    Les microsecondes sont coupees : le seuil recule au plus d'une seconde,
+    on relit donc un peu trop, jamais trop peu.
+    """
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc)
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _since_clause(since: datetime | None) -> list:
+    """Condition Odoo 'modifie depuis since' (liste vide si since est None)."""
+    if since is None:
+        return []
+    return [["write_date", ">=", _odoo_datetime(since)]]
+
+
 class OdooConnector:
     source = SOURCE
+    # Marge relue avant le point de reprise : couvre les ecritures tardives.
+    overlap = timedelta(minutes=5)
 
     def __init__(self, url: str, db: str, user: str, password: str):
         self.url = url.rstrip("/")
@@ -104,12 +131,17 @@ class OdooConnector:
         except (OSError, xmlrpc.client.Error):
             return False
 
+    def record_modified_at(self, record: dict) -> datetime | None:
+        """Date de derniere modification d'un enregistrement brut (write_date)."""
+        return to_datetime(record.get("write_date"))
+
     # ---------- Clients ----------
-    def fetch_customers(self) -> list[dict]:
+    def fetch_customers(self, since: datetime | None = None) -> list[dict]:
         """Societes d'Odoo, hors societe proprietaire de la base."""
         companies = self._call("res.company", "search_read", [], fields=["partner_id"])
         own_ids = [c["partner_id"][0] for c in companies if c["partner_id"]]
         domain = [["is_company", "=", True], ["id", "not in", own_ids]]
+        domain += _since_clause(since)
         return self._call("res.partner", "search_read", domain, fields=FIELDS)
 
     def normalize(self, record: dict) -> Customer:
@@ -127,9 +159,9 @@ class OdooConnector:
         )
 
     # ---------- Factures et avoirs ----------
-    def fetch_invoices(self) -> list[dict]:
+    def fetch_invoices(self, since: datetime | None = None) -> list[dict]:
         """Factures et avoirs clients, tous statuts confondus."""
-        domain = [["move_type", "in", MOVE_TYPES]]
+        domain = [["move_type", "in", MOVE_TYPES]] + _since_clause(since)
         return self._call("account.move", "search_read", domain, fields=INVOICE_FIELDS)
 
     def normalize_invoice(self, record: dict) -> Invoice:
@@ -153,13 +185,18 @@ class OdooConnector:
     def fetch_invoice_lines(self, invoices: list[dict] | None = None) -> list[dict]:
         """Lignes produit des factures et avoirs clients.
 
-        `invoices` est accepte pour respecter le contrat commun des connecteurs,
-        mais Odoo lit toutes les lignes en un seul appel : le parametre est ignore.
+        Sans `invoices` : toutes les lignes. Avec une liste de factures : seulement
+        les lignes de ces factures (liste vide : aucune ligne, aucun appel).
         """
         domain = [
             ["move_id.move_type", "in", MOVE_TYPES],
             ["display_type", "=", "product"],
         ]
+        if invoices is not None:
+            invoice_ids = [invoice["id"] for invoice in invoices]
+            if not invoice_ids:
+                return []
+            domain.append(["move_id", "in", invoice_ids])
         return self._call("account.move.line", "search_read", domain, fields=LINE_FIELDS)
 
     def normalize_invoice_line(self, record: dict) -> InvoiceLine:
@@ -177,9 +214,11 @@ class OdooConnector:
         )
 
     # ---------- Articles ----------
-    def fetch_items(self) -> list[dict]:
+    def fetch_items(self, since: datetime | None = None) -> list[dict]:
         """Articles actifs (variantes de produit)."""
-        return self._call("product.product", "search_read", [], fields=ITEM_FIELDS)
+        return self._call(
+            "product.product", "search_read", _since_clause(since), fields=ITEM_FIELDS
+        )
 
     def normalize_item(self, record: dict) -> Item:
         return Item(

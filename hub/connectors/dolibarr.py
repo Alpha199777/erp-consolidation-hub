@@ -2,14 +2,21 @@
 
 Contrat commun aux connecteurs :
   - ping()
-  - fetch_customers() / normalize()
-  - fetch_invoices() / normalize_invoice()
-  - fetch_invoice_lines() / normalize_invoice_line()
-  - fetch_items() / normalize_item()
+  - fetch_customers(since=None) / normalize()
+  - fetch_invoices(since=None) / normalize_invoice()
+  - fetch_invoice_lines(invoices=None) / normalize_invoice_line()
+  - fetch_items(since=None) / normalize_item()
+  - record_modified_at(record) : date de modification d'un enregistrement brut
+  - overlap : marge relue avant le point de reprise (synchronisation incrementale)
+
+`since` : sans lui, lecture complete ; avec lui, seulement les enregistrements dont
+t.tms est strictement apres cette date (seule syntaxe validee). La marge d'un jour
+(overlap) rend la difference avec >= sans effet.
 """
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -56,8 +63,21 @@ def _invoice_status(record: dict) -> str | None:
     return f"{label}/{paid}"
 
 
+def _since_filter(since: datetime) -> str:
+    """Filtre Dolibarr 'modifie apres since' sur t.tms (UTC, a la seconde).
+
+    Un instant sans fuseau est lu comme UTC (meme hypothese que to_datetime).
+    """
+    if since.tzinfo is not None:
+        since = since.astimezone(timezone.utc)
+    return f"(t.tms:>:'{since.strftime('%Y-%m-%d %H:%M:%S')}')"
+
+
 class DolibarrConnector:
     source = "dolibarr"
+    # Marge relue avant le point de reprise : le fuseau de t.tms n'est pas verifie,
+    # un jour couvre tout decalage horaire.
+    overlap = timedelta(days=1)
 
     def __init__(self, url: str, api_key: str, page_size: int = DEFAULT_PAGE_SIZE):
         self.base = url.rstrip("/") + "/api/index.php"
@@ -80,18 +100,24 @@ class DolibarrConnector:
             timeout=TIMEOUT,
         )
 
-    def _get_all(self, path: str) -> list[dict]:
+    def _page_params(self, page: int, since: datetime | None) -> dict:
+        """Paramètres d'une page ; le filtre de date n'est ajouté que s'il y a un since."""
+        params = {
+            "limit": self.page_size,
+            "page": page,
+            "sortfield": "t.rowid",
+            "sortorder": "ASC",
+        }
+        if since is not None:
+            params["sqlfilters"] = _since_filter(since)
+        return params
+
+    def _get_all(self, path: str, since: datetime | None = None) -> list[dict]:
         """Parcourt toutes les pages d'une liste (page vide = 404 chez Dolibarr)."""
         records: list[dict] = []
         page = 0
         while True:
-            r = self._get(
-                path,
-                limit=self.page_size,
-                page=page,
-                sortfield="t.rowid",
-                sortorder="ASC",
-            )
+            r = self._get(path, **self._page_params(page, since))
             if r.status_code == 404:  # page vide : fin des données
                 break
             r.raise_for_status()
@@ -108,19 +134,17 @@ class DolibarrConnector:
         except requests.RequestException:
             return False
 
+    def record_modified_at(self, record: dict) -> datetime | None:
+        """Date de derniere modification d'un enregistrement brut (date_modification, Unix)."""
+        return to_datetime(record.get("date_modification"))
+
     # ---------- Clients ----------
-    def fetch_customers(self) -> list[dict]:
+    def fetch_customers(self, since: datetime | None = None) -> list[dict]:
         """Retourne les enregistrements bruts des clients (client = 1 ou 3)."""
         records: list[dict] = []
         page = 0
         while True:
-            r = self._get(
-                "thirdparties",
-                limit=self.page_size,
-                page=page,
-                sortfield="t.rowid",
-                sortorder="ASC",
-            )
+            r = self._get("thirdparties", **self._page_params(page, since))
             if r.status_code == 404:  # page vide : fin des données
                 break
             r.raise_for_status()
@@ -145,9 +169,11 @@ class DolibarrConnector:
         )
 
     # ---------- Factures ----------
-    def fetch_invoices(self) -> list[dict]:
+    def fetch_invoices(self, since: datetime | None = None) -> list[dict]:
         """Factures clients brutes, avec leurs lignes (champ `lines`)."""
-        return self._get_all("invoices")
+        if since is None:
+            return self._get_all("invoices")
+        return self._get_all("invoices", since=since)
 
     def normalize_invoice(self, record: dict) -> Invoice:
         is_credit_note = str(clean(record.get("type"))) in CREDIT_NOTE_TYPES
@@ -196,9 +222,11 @@ class DolibarrConnector:
         )
 
     # ---------- Articles ----------
-    def fetch_items(self) -> list[dict]:
+    def fetch_items(self, since: datetime | None = None) -> list[dict]:
         """Produits et services bruts."""
-        return self._get_all("products")
+        if since is None:
+            return self._get_all("products")
+        return self._get_all("products", since=since)
 
     def normalize_item(self, record: dict) -> Item:
         return Item(

@@ -9,6 +9,13 @@ Contrat commun aux connecteurs :
   - record_modified_at(record) : date de modification d'un enregistrement brut
   - overlap : marge relue avant le point de reprise (synchronisation incrementale)
 
+Dates : ERPNext ecrit `modified` en heure du serveur, sans fuseau (constate : environ
+deux heures d'ecart avec l'UTC en octobre 2026). Le connecteur lit ces dates dans le
+fuseau du serveur (Europe/Paris par defaut, variable optionnelle ERPNEXT_TIMEZONE) et
+les convertit en UTC. Le filtre `since` est reconverti dans ce meme fuseau.
+Limite : l'heure repetee du passage a l'heure d'hiver est lue comme de l'heure d'ete
+(erreur d'au plus une heure sur cette seule heure ; un rechargement complet la rattrape).
+
 Ville, code postal et pays ne sont pas sur le Customer : ils sont dans le
 doctype Address, relie au client par une table enfant (links). fetch_customers()
 enrichit chaque client avec l'adresse retenue (voir choose_address).
@@ -21,8 +28,9 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -33,12 +41,13 @@ from hub.models import (
     Item,
     clean,
     to_date,
-    to_datetime,
     to_decimal,
 )
 
 ENV_KEYS = ("ERPNEXT_URL", "ERPNEXT_API_KEY", "ERPNEXT_API_SECRET")
+ENV_TIMEZONE_KEY = "ERPNEXT_TIMEZONE"  # optionnelle
 
+DEFAULT_SERVER_TZ = "Europe/Paris"
 DEFAULT_PAGE_SIZE = 100
 TIMEOUT = 15
 
@@ -50,15 +59,23 @@ def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc)
 
 
-def _erpnext_datetime(since: datetime) -> str:
-    """Instant -> texte du champ `modified` d'ERPNext (UTC, avec microsecondes)."""
-    return _utc(since).strftime("%Y-%m-%d %H:%M:%S.%f")
+def _server_text(instant: datetime, server_tz: tzinfo) -> str:
+    """Instant -> texte du champ `modified` d'ERPNext (heure du serveur, microsecondes)."""
+    return _utc(instant).astimezone(server_tz).strftime("%Y-%m-%d %H:%M:%S.%f")
 
 
-def _newest_modified(values: list) -> str | None:
-    """Plus recente des dates de modification (texte d'origine), ou None."""
-    dated = [(to_datetime(v), v) for v in values if clean(v) is not None]
-    return max(dated, key=lambda pair: pair[0])[1] if dated else None
+def _parse_server_datetime(value, server_tz: tzinfo) -> datetime | None:
+    """Date ERPNext (heure du serveur, sans fuseau) -> instant UTC.
+
+    Une date qui porte deja un fuseau est respectee.
+    """
+    value = clean(value)
+    if value is None:
+        return None
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=server_tz)
+    return parsed.astimezone(timezone.utc)
 
 
 def choose_address(addresses: list[dict], primary_name: str | None = None) -> dict | None:
@@ -92,16 +109,19 @@ def choose_address(addresses: list[dict], primary_name: str | None = None) -> di
 
 class ERPNextConnector:
     source = "erpnext"
-    # Marge relue avant le point de reprise : couvre les ecritures tardives et le
-    # fuseau du serveur (non verifie, lu comme UTC).
+    # Marge relue avant le point de reprise : couvre les ecritures tardives.
     overlap = timedelta(minutes=5)
+    # Fuseau du serveur (valeur par defaut de la classe : utilisable sans __init__).
+    server_tz = ZoneInfo(DEFAULT_SERVER_TZ)
 
     def __init__(self, url: str, api_key: str, api_secret: str,
-                 page_size: int = DEFAULT_PAGE_SIZE):
+                 page_size: int = DEFAULT_PAGE_SIZE,
+                 server_tz: str = DEFAULT_SERVER_TZ):
         self.url = url.rstrip("/")
         self.api_key = api_key
         self.api_secret = api_secret
         self.page_size = page_size
+        self.server_tz = ZoneInfo(server_tz)
 
     @classmethod
     def from_env(cls):
@@ -109,7 +129,8 @@ class ERPNextConnector:
         values = [os.getenv(k) for k in ENV_KEYS]
         if not all(values):
             return None
-        return cls(*values)
+        server_tz = clean(os.getenv(ENV_TIMEZONE_KEY)) or DEFAULT_SERVER_TZ
+        return cls(*values, server_tz=server_tz)
 
     def _get(self, path: str, **params):
         return requests.get(
@@ -130,13 +151,22 @@ class ERPNextConnector:
         except requests.RequestException:
             return False
 
+    def _to_utc(self, value) -> datetime | None:
+        """Date ERPNext (heure du serveur) -> instant UTC."""
+        return _parse_server_datetime(value, self.server_tz)
+
+    def _newest_modified(self, values: list) -> str | None:
+        """Plus recente des dates de modification (texte d'origine), ou None."""
+        dated = [(self._to_utc(v), v) for v in values if clean(v) is not None]
+        return max(dated, key=lambda pair: pair[0])[1] if dated else None
+
     def record_modified_at(self, record: dict) -> datetime | None:
-        """Date de derniere modification d'un enregistrement brut.
+        """Date de derniere modification d'un enregistrement brut, en UTC.
 
         Pour un client dont l'adresse a change plus tard, `_modified_max` (ajoute par
         fetch_customers) l'emporte sur `modified`.
         """
-        return to_datetime(record.get("_modified_max") or record.get("modified"))
+        return self._to_utc(record.get("_modified_max") or record.get("modified"))
 
     # ---------- Clients ----------
     def fetch_customers(self, since: datetime | None = None) -> list[dict]:
@@ -161,7 +191,7 @@ class ERPNextConnector:
             chosen = choose_address(linked, clean(record.get("customer_primary_address")))
             if chosen is not None:
                 record["_address"] = chosen
-            newest = _newest_modified(
+            newest = self._newest_modified(
                 [record.get("modified")] + [a.get("modified") for a in linked]
             )
             if newest is not None and newest != record.get("modified"):
@@ -174,15 +204,12 @@ class ERPNextConnector:
         """Clients absents de `records` mais dont une adresse a change depuis `since`."""
         known = {str(r["name"]) for r in records}
         limit = _utc(since)
+        oldest = datetime.min.replace(tzinfo=timezone.utc)
         extra: list[dict] = []
         for name, linked in addresses.items():
             if name in known:
                 continue
-            if not any(
-                (to_datetime(a.get("modified")) or datetime.min.replace(tzinfo=timezone.utc))
-                >= limit
-                for a in linked
-            ):
+            if not any((self._to_utc(a.get("modified")) or oldest) >= limit for a in linked):
                 continue
             response = self._get(f"/api/resource/{quote('Customer')}/{quote(name)}")
             if response.status_code == 404:  # adresse liee a un client disparu : on ignore
@@ -230,7 +257,8 @@ class ERPNextConnector:
     def _list(self, doctype: str, since: datetime | None = None) -> list[dict]:
         """Pagine /api/resource/<doctype> (nom du doctype URL-encodé).
 
-        Avec `since` : filtre serveur `modified >= since` envoye a chaque page.
+        Avec `since` : filtre serveur `modified >= since` (heure du serveur) envoye
+        a chaque page.
         """
         records: list[dict] = []
         start = 0
@@ -242,7 +270,9 @@ class ERPNextConnector:
                 "order_by": "name asc",
             }
             if since is not None:
-                params["filters"] = json.dumps([["modified", ">=", _erpnext_datetime(since)]])
+                params["filters"] = json.dumps(
+                    [["modified", ">=", _server_text(since, self.server_tz)]]
+                )
             response = self._get(f"/api/resource/{quote(doctype)}", **params)
             response.raise_for_status()
             batch = response.json().get("data", [])
@@ -269,7 +299,7 @@ class ERPNextConnector:
             currency=clean(record.get("currency")),
             total_excl_tax=to_decimal(record.get("net_total")),
             total_incl_tax=to_decimal(record.get("grand_total")),
-            source_modified_at=to_datetime(record.get("modified")),
+            source_modified_at=self._to_utc(record.get("modified")),
             payload=record,
         )
 
@@ -301,7 +331,7 @@ class ERPNextConnector:
             quantity=to_decimal(record.get("qty")),
             unit_price=to_decimal(record.get("rate")),
             total_excl_tax=to_decimal(record.get("amount")),
-            source_modified_at=to_datetime(
+            source_modified_at=self._to_utc(
                 record.get("modified") or record.get("_invoice_modified")
             ),
             payload=record,
@@ -321,6 +351,6 @@ class ERPNextConnector:
             category=clean(record.get("item_group")),
             sale_price=to_decimal(record.get("standard_rate")),
             is_sellable=bool(record.get("is_sales_item")) and not bool(record.get("disabled")),
-            source_modified_at=to_datetime(record.get("modified")),
+            source_modified_at=self._to_utc(record.get("modified")),
             payload=record,
         )

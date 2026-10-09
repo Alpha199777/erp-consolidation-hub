@@ -9,10 +9,13 @@ import requests
 
 from hub.connectors.erpnext import ERPNextConnector
 
-SINCE = datetime(2026, 10, 6, 17, 26, 20, tzinfo=timezone.utc)
+# Le serveur ERPNext ecrit ses dates en heure de Paris : en octobre 2026 (heure d'ete),
+# 15:26:20 UTC s'ecrit 17:26:20 cote serveur.
+SINCE = datetime(2026, 10, 6, 15, 26, 20, tzinfo=timezone.utc)
 SINCE_TEXTE = "2026-10-06 17:26:20.000000"
 FILTRE = json.dumps([["modified", ">=", SINCE_TEXTE]])
 
+# Dates ecrites comme le serveur les ecrit (heure de Paris).
 AVANT = "2026-09-30 10:00:00.000000"
 APRES = "2026-10-06 18:00:00.000000"
 APRES_ADRESSE = "2026-10-07 09:00:00.000000"
@@ -97,17 +100,30 @@ def test_sans_since_aucun_filtre_et_aucun_detail_client():
     assert not any(a["path"].startswith("/api/resource/Customer/") for a in appels)
 
 
-def test_since_envoie_le_filtre_modified():
+def test_since_envoie_le_filtre_modified_en_heure_du_serveur():
     connecteur, appels = fabrique([client("C1", APRES)])
     connecteur.fetch_customers(since=SINCE)
     assert appels_vers(appels, "/api/resource/Customer")[0]["params"]["filters"] == FILTRE
 
 
-def test_since_avec_fuseau_converti_en_utc():
+def test_since_avec_decalage_converti_en_heure_du_serveur():
     connecteur, appels = fabrique([])
     deux_heures = timezone(timedelta(hours=2))
-    connecteur.fetch_items(since=datetime(2026, 10, 6, 19, 26, 20, tzinfo=deux_heures))
+    connecteur.fetch_items(since=datetime(2026, 10, 6, 17, 26, 20, tzinfo=deux_heures))
     assert appels_vers(appels, "/api/resource/Item")[0]["params"]["filters"] == FILTRE
+
+
+def test_since_sans_fuseau_lu_comme_utc():
+    connecteur, appels = fabrique([])
+    connecteur.fetch_items(since=datetime(2026, 10, 6, 15, 26, 20))
+    assert appels_vers(appels, "/api/resource/Item")[0]["params"]["filters"] == FILTRE
+
+
+def test_since_en_hiver_decale_d_une_heure():
+    connecteur, appels = fabrique([])
+    connecteur.fetch_items(since=datetime(2026, 12, 1, 12, 0, tzinfo=timezone.utc))
+    attendu = json.dumps([["modified", ">=", "2026-12-01 13:00:00.000000"]])
+    assert appels_vers(appels, "/api/resource/Item")[0]["params"]["filters"] == attendu
 
 
 def test_invoices_since():
@@ -161,7 +177,7 @@ def test_adresse_liee_a_un_client_introuvable_est_ignoree():
     assert connecteur.fetch_customers(since=SINCE) == []
 
 
-def test_record_modified_at_lit_modified_en_utc():
+def test_record_modified_at_lit_modified_en_heure_du_serveur():
     connecteur = ERPNextConnector("http://x", "k", "s")
     assert connecteur.record_modified_at({"modified": "2026-10-06 17:26:20"}) == SINCE
 
@@ -169,13 +185,13 @@ def test_record_modified_at_lit_modified_en_utc():
 def test_record_modified_at_prefere_modified_max():
     connecteur = ERPNextConnector("http://x", "k", "s")
     record = {"modified": AVANT, "_modified_max": APRES_ADRESSE}
-    assert connecteur.record_modified_at(record) == datetime(2026, 10, 7, 9, 0, tzinfo=timezone.utc)
+    assert connecteur.record_modified_at(record) == datetime(2026, 10, 7, 7, 0, tzinfo=timezone.utc)
 
 
 def test_record_modified_at_sans_modified_max_lit_modified():
     connecteur = ERPNextConnector("http://x", "k", "s")
     assert connecteur.record_modified_at({"modified": AVANT}) == datetime(
-        2026, 9, 30, 10, 0, tzinfo=timezone.utc
+        2026, 9, 30, 8, 0, tzinfo=timezone.utc
     )
 
 

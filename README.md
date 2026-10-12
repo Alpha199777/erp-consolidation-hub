@@ -15,7 +15,7 @@ interrogeables par Claude via un serveur MCP.
 | 1 | 3 ERP, 3 connecteurs, clients dans `raw`, journal `raw.sync_runs` | Terminé |
 | 2 | Factures, articles, synchronisation incrémentale, adresses ERPNext | Terminé (voir limites) |
 | 3 | Couche `core` : rapprochement des clients entre ERP | Terminé (voir limites) |
-| 4 | Couche `quality` : règles de contrôle et anomalies | À faire |
+| 4 | Couche `quality` : règles de contrôle et anomalies | Terminé (voir limites) |
 | 5 | Rapport Power BI | À faire |
 | 6 | Serveur MCP | À faire |
 
@@ -27,7 +27,8 @@ interrogeables par Claude via un serveur MCP.
 - `core` : référentiel unifié des clients. `core.customers` (un client = une ligne) et
   `core.customer_links` (quelle fiche de `raw.customers` appartient à quel client, et par
   quelle règle). Voir « Rapprochement des clients ».
-- `quality` : anomalies détectées (sprint 4).
+- `quality` : anomalies détectées. `quality.anomalies` (une ligne par anomalie, avec sa
+  gravité, son statut et ses dates). Voir « Contrôle qualité ».
 
 Chaque connecteur (`hub/connectors/`) respecte le même contrat :
 `ping()`, `fetch_customers(since=None)` / `normalize()`,
@@ -84,7 +85,35 @@ première valeur renseignée dans l'ordre Odoo, ERPNext, Dolibarr. Tout est fait
 transaction. Les pays sont ramenés à un code ISO sur 2 lettres.
 
 `hub/review_core.py` liste, en lecture seule, les fiches qui se ressemblent sans avoir été
-fusionnées. Au sprint 4, ces cas deviendront des anomalies suivies.
+fusionnées. Ces cas sont aussi suivis comme anomalies (règle `lookalike_customers`).
+
+## Contrôle qualité (couche `quality`)
+
+Principe : une anomalie est un fait suivi dans le temps, pas une ligne d'un rapport jetable.
+Elle est identifiée par `(rule_code, entity_key)` (contrainte UNIQUE), donc une relance ne
+crée jamais de doublon.
+
+7 règles (`hub/quality_rules.py`, logique pure testée sans base) :
+
+| Règle | Gravité | Contrôle |
+|---|---|---|
+| `customer_missing_email` | basse | client sans e-mail |
+| `cross_erp_mismatch` | moyenne | client présent dans plusieurs ERP avec e-mail, code postal, ville ou pays différents |
+| `lookalike_customers` | moyenne | fiches qui se ressemblent sans avoir été fusionnées (reprend `review_core`) |
+| `unknown_country` | basse | pays non reconnu |
+| `invoice_unknown_customer` | haute | facture dont le client est introuvable |
+| `invoice_total_mismatch` | haute | total de la facture différent de la somme des lignes (tolérance 0,01) |
+| `invoice_due_before_date` | moyenne | échéance antérieure à la date de facture |
+
+Cycle de vie (`hub/run_quality.py`, fonction pure `plan_sync`, écriture en une transaction) :
+
+| Situation | Effet |
+|---|---|
+| Nouvelle anomalie | créée au statut `open` |
+| Déjà connue, toujours détectée | date de dernière détection mise à jour |
+| `fixed` qui réapparaît | repasse en `open` |
+| `open` ou `accepted` qui disparaît | passe en `fixed`, `resolved_at` renseigné |
+| `accepted` | posé à la main par `UPDATE` pour ignorer une anomalie connue |
 
 ## Résultats du sprint 1 (mesuré en local)
 
@@ -137,6 +166,20 @@ trouvés dans des données réelles.
   non fusionnées).
 - 295 tests pytest.
 
+## Résultats du sprint 4 (mesuré en local, 12 octobre 2026)
+
+- 18 anomalies ouvertes sur les données de démonstration : 17 `customer_missing_email`
+  (19 fiches sans e-mail, dont 2 rattachées à un client qui en a un) et 1
+  `lookalike_customers` (`Grant Plastic` et `Grant Plastics Ltd.`, même ERP).
+- 5 règles à 0 sur ces données : `cross_erp_mismatch`, `unknown_country` et les 3 règles de
+  factures. Ce sont des contrôles vérifiés à zéro, jamais déclenchés par des données réelles.
+- Relance de `hub.run_quality` : 0 nouvelle, 0 réapparue, 0 corrigée.
+- Cycle de vie prouvé sur un cas construit : le code postal d'`Easy Clean Lausanne SA` a été
+  changé à la main dans Dolibarr (1004 puis 1003), `cross_erp_mismatch` a détecté l'écart
+  (19 détectées, 1 nouvelle), puis le code postal a été remis à 1004 : l'anomalie est passée
+  en `fixed` avec `resolved_at` renseigné.
+- 313 tests pytest.
+
 ## Limites connues
 
 - Les suppressions ne sont pas détectées : un enregistrement supprimé dans un ERP reste
@@ -168,6 +211,15 @@ trouvés dans des données réelles.
   choix de départ, pas une règle métier validée. Le rapport des cas douteux compare toutes
   les paires de fiches : acceptable pour quelques milliers de fiches, pas pour des centaines
   de milliers.
+- Qualité : les gravités (basse, moyenne, haute) sont un choix de départ, pas validé par un
+  métier. Les règles de factures et `unknown_country` n'ont jamais détecté d'anomalie sur les
+  données de démonstration ; elles ne sont éprouvées que par des tests unitaires.
+- Qualité : les statuts `accepted` et « réapparue » sont testés en tests unitaires (et sur une
+  base temporaire), pas sur la base de démonstration. `accepted` se pose à la main.
+- Qualité : le message de `cross_erp_mismatch` cite le premier nom par ordre alphabétique,
+  pas le nom retenu pour le client unifié (cosmétique).
+- Qualité : `core` ne contient que les clients ; les factures ne sont pas encore rattachées
+  à un client unifié.
 
 ## Prérequis
 
@@ -185,13 +237,14 @@ copy .env.example .env
 Renseigner ensuite `.env` (clés API, URL de la base). Ne jamais commiter `.env`.
 `ERPNEXT_TIMEZONE` est optionnelle (`Europe/Paris` par défaut).
 
-Créer les tables des couches `raw` et `core` (les scripts sont rejouables sans risque) :
+Créer les tables des couches `raw`, `core` et `quality` (les scripts sont rejouables sans risque) :
 
 ```powershell
 Get-Content sql\001_raw_schema.sql | docker exec -i hub-db psql -U hub -d hub -v ON_ERROR_STOP=1
 Get-Content sql\002_raw_invoices_items.sql | docker exec -i hub-db psql -U hub -d hub -v ON_ERROR_STOP=1
 Get-Content sql\003_sync_state.sql | docker exec -i hub-db psql -U hub -d hub -v ON_ERROR_STOP=1
 Get-Content sql\004_core_schema.sql | docker exec -i hub-db psql -U hub -d hub -v ON_ERROR_STOP=1
+Get-Content sql\005_quality_schema.sql | docker exec -i hub-db psql -U hub -d hub -v ON_ERROR_STOP=1
 ```
 
 ## ERP et ports
@@ -214,6 +267,7 @@ python -m hub.run_sprint2 --full         # rechargement complet
 python -m hub.build_core                 # rattache les nouvelles fiches de raw à core
 python -m hub.build_core --rebuild       # vide core et reconstruit tout depuis raw
 python -m hub.review_core                # cas douteux non fusionnés (lecture seule)
+python -m hub.run_quality                # applique les règles, met à jour quality.anomalies
 Get-Content sql\checks_sprint2.sql | docker exec -i hub-db psql -U hub -d hub   # contrôles en lecture seule
 python -m pytest -q                      # tests (certains nécessitent la base hub)
 ```
@@ -230,8 +284,11 @@ les variables `.env` sont absentes est ignoré.
 - `hub/matching.py` : règles de rapprochement des clients (logique pure)
 - `hub/build_core.py` : construction de la couche `core`
 - `hub/review_core.py` : rapport des cas douteux
+- `hub/quality_rules.py` : les 7 règles de contrôle (logique pure)
+- `hub/run_quality.py` : cycle de vie des anomalies et écriture dans `quality`
 - `sql/001_raw_schema.sql`, `sql/002_raw_invoices_items.sql`, `sql/003_sync_state.sql` : schéma `raw`
 - `sql/004_core_schema.sql` : schéma `core`
+- `sql/005_quality_schema.sql` : schéma `quality`
 - `sql/checks_sprint2.sql` : contrôles de la couche `raw` (lecture seule)
 - `scripts/` : explorations et vérifications en lecture seule
 - `tests/` : tests unitaires et d'intégration

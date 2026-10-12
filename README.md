@@ -14,7 +14,7 @@ interrogeables par Claude via un serveur MCP.
 |---|---|---|
 | 1 | 3 ERP, 3 connecteurs, clients dans `raw`, journal `raw.sync_runs` | Terminé |
 | 2 | Factures, articles, synchronisation incrémentale, adresses ERPNext | Terminé (voir limites) |
-| 3 | Couche `core` : rapprochement des clients entre ERP | En cours |
+| 3 | Couche `core` : rapprochement des clients entre ERP | Terminé (voir limites) |
 | 4 | Couche `quality` : règles de contrôle et anomalies | À faire |
 | 5 | Rapport Power BI | À faire |
 | 6 | Serveur MCP | À faire |
@@ -117,7 +117,7 @@ Volumes dans `raw` :
   ou a été modifié après le sprint 1 ; la cause exacte n'est pas vérifiée.
 - 236 tests pytest.
 
-## Résultats du sprint 3 (mesuré en local, 12 octobre 2026, sprint en cours)
+## Résultats du sprint 3 (mesuré en local, 12 octobre 2026)
 
 Les données de démonstration des trois ERP ne contenaient aucun client commun. Pour exercer
 les règles, 4 fiches de test ont été créées à la main : `Easy Clean Lausanne SA` (Dolibarr),
@@ -131,6 +131,7 @@ trouvés dans des données réelles.
 - Clients présents dans 1 ERP : 36 ; dans 2 ERP : 1 (`Azure Interior`) ; dans 3 ERP : 1
   (`Easy Clean Lausanne`).
 - Relance de `hub.build_core` : 0 nouveau lien, 0 nouveau client, 0 mise à jour.
+- Contrôle SQL : 0 fiche sans client, 0 client sans fiche, 0 fiche rattachée deux fois.
 - `Company Corp 1` et `Company Corp 2` restent deux clients.
 - Rapport des cas douteux : 1 paire (`Grant Plastic` et `Grant Plastics Ltd.`, même ERP,
   non fusionnées).
@@ -157,8 +158,9 @@ trouvés dans des données réelles.
 - Le téléphone mobile Dolibarr (`phone_mobile`) reste dans le payload, pas dans la colonne
   `phone`.
 - Rapprochement : le seuil de ressemblance (0,85) a été choisi sur quelques cas, pas calibré
-  sur des données réelles. La table des pays ne couvre que ceux vus dans les trois ERP : un
-  pays inconnu donne un code vide et n'empêche pas la fusion.
+  sur des données réelles ; aucune précision ni aucun rappel mesurés. La table des pays ne
+  couvre que ceux vus dans les trois ERP : un pays inconnu donne un code vide et n'empêche
+  pas la fusion.
 - Rapprochement : une fiche déjà rattachée n'est pas réévaluée si son contenu change dans
   `raw` ; après un changement de règles, utiliser `python -m hub.build_core --rebuild`
   (les `customer_id` sont alors recréés).

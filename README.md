@@ -17,7 +17,7 @@ interrogeables par Claude via un serveur MCP.
 | 3 | Couche `core` : rapprochement des clients entre ERP | Terminé (voir limites) |
 | 4 | Couche `quality` : règles de contrôle et anomalies | Terminé (voir limites) |
 | 5 | Rapport Power BI : modèle en étoile et page anomalies | Terminé (voir limites) |
-| 6 | Serveur MCP | À faire |
+| 6 | Serveur MCP : `core` et `quality` interrogeables par Claude (via le schéma `reporting`) | Terminé (voir limites) |
 
 ## Architecture
 
@@ -30,7 +30,7 @@ interrogeables par Claude via un serveur MCP.
 - `quality` : anomalies détectées. `quality.anomalies` (une ligne par anomalie, avec sa
   gravité, son statut et ses dates). Voir « Contrôle qualité ».
 - `reporting` : vues en lecture seule pour Power BI (`dim_customer`, `fact_invoice`, `dim_date`,
-  `anomalies`). Voir « Rapport Power BI ».
+  `anomalies`). Voir « Rapport Power BI ». Le serveur MCP lit aussi ce schéma.
 
 Chaque connecteur (`hub/connectors/`) respecte le même contrat :
 `ping()`, `fetch_customers(since=None)` / `normalize()`,
@@ -143,6 +143,48 @@ pour la mettre à jour, utiliser Actualiser dans Power BI.
 Page « Anomalies » : nombre d'anomalies ouvertes, anomalies ouvertes par règle, tableau de détail
 avec statut. Page « Factures » : chiffre d'affaires net par devise (CHF, EUR).
 
+## Serveur MCP (sprint 6)
+
+Principe : Claude ne reçoit jamais un accès libre à la base. Il appelle 4 outils fixes, qui
+lisent uniquement le schéma `reporting`. La lecture seule est garantie par PostgreSQL, pas
+seulement par le code.
+
+Outils (`hub/mcp_server.py`, transport stdio) :
+
+| Outil | Rôle |
+|---|---|
+| `list_open_anomalies` | anomalies ouvertes, les plus graves d'abord ; filtres `rule_code`, `severity`, `limit` (1 à 100) |
+| `get_anomaly` | détail d'une anomalie par son identifiant (`found: false` si elle n'existe pas) |
+| `find_customer` | recherche d'un client unifié par nom ou e-mail (2 caractères minimum) |
+| `invoice_totals_by_currency` | factures, avoirs et net hors taxes, une ligne par devise |
+
+Sécurité :
+
+- compte `hub_reader` (`sql/007_reader_role.sql`) : `default_transaction_read_only = on`,
+  accès au seul schéma `reporting` ; `raw`, `core` et `quality` lui sont fermés. Les vues lisent
+  leurs tables avec les droits de leur propriétaire. `scripts/check_reader.py` lance 9 contrôles.
+- le mot de passe est dans `.env` (`HUB_READER_PASSWORD`), jamais dans le code.
+- les noms et messages renvoyés viennent des ERP : ce sont des données, pas des instructions.
+  Le serveur le rappelle à Claude dans ses instructions.
+- en stdio, la sortie standard est le canal du protocole : aucun `print()` dans le serveur.
+
+Fonctionnement : `hub/read_api.py` contient les requêtes (testables sans MCP) ; chaque appel
+ouvre sa propre connexion, puis la referme. Une demande invalide renvoie son message à Claude
+(`ToolError`) au lieu d'une erreur générique.
+
+Connexion à Claude Desktop : ajouter dans `%APPDATA%\Claude\claude_desktop_config.json`
+(adapter les chemins) puis quitter complètement l'application et la relancer :
+
+```json
+"mcpServers": {
+  "erp-hub": {
+    "command": "C:\\chemin\\vers\\erp-consolidation-hub\\.venv\\Scripts\\python.exe",
+    "args": ["-m", "hub.mcp_server"],
+    "env": { "PYTHONPATH": "C:\\chemin\\vers\\erp-consolidation-hub" }
+  }
+}
+```
+
 ## Résultats du sprint 1 (mesuré en local)
 
 - 36 clients chargés : 8 Odoo, 25 Dolibarr, 3 ERPNext.
@@ -223,6 +265,22 @@ trouvés dans des données réelles.
 - Aucun nouveau test pytest (313 au total) : les vues sont contrôlées par des requêtes SQL
   lancées à la main, pas par des tests automatiques.
 
+## Résultats du sprint 6 (mesuré en local, 14 octobre 2026)
+
+- Compte `hub_reader` : 9 contrôles réussis (lecture de `reporting`, refus sur `raw`, `core`,
+  `quality`, refus d'écriture).
+- 335 tests pytest (22 de plus qu'au sprint 5 : 15 sur `read_api`, 7 sur le serveur MCP).
+- Serveur connecté à Claude Desktop, 4 outils visibles, réglés sur « Nécessite une approbation ».
+- 4 questions réelles posées à Claude, réponses rapprochées de la base :
+  18 anomalies ouvertes (1 `lookalike_customers`, 17 `customer_missing_email`), comme Power BI ;
+  `Easy Clean Lausanne` (client n° 25, 3 ERP, `info@easycleanlausanne.ch`, CH, 1004), identique à
+  `reporting.dim_customer` ; 363 000 CHF (9 factures, 5 avoirs) et 122,24 EUR (6 factures), comme
+  Power BI, et Claude refuse de les additionner ; anomalie 18 détaillée, anomalie 9999 renvoie
+  `found: false`.
+- Contrôle SQL de `reporting.fact_invoice` par source : les 5 avoirs viennent tous d'Odoo
+  (net signé -124 500 CHF contre 124 500 CHF de factures). Aucun brouillon ni facture annulée
+  dans les données.
+
 ## Limites connues
 
 - Les suppressions ne sont pas détectées : un enregistrement supprimé dans un ERP reste
@@ -274,9 +332,24 @@ trouvés dans des données réelles.
   pas `due_date`. `signed_total_excl_tax` n'est vérifié que pour Odoo : Dolibarr et ERPNext n'ont
   aucun avoir dans les données. Aucune conversion CHF/EUR.
 
+- MCP : les outils ne renvoient que des anomalies ouvertes (sauf `get_anomaly`) et des fiches
+  unifiées. Ils n'exposent ni le score de similarité, ni les valeurs comparées par une règle, ni la
+  liste des règles actives : Claude ne peut pas distinguer « règle sans résultat » de « règle jamais
+  exécutée ». Pas de détail par ERP pour un client.
+- MCP : transport stdio uniquement (un client local lance le processus). Pas d'accès à distance,
+  pas d'authentification applicative : la protection repose sur le compte `hub_reader` en lecture
+  seule et sur l'approbation de chaque appel dans Claude Desktop.
+- MCP : `invoice_totals_by_currency` additionne tous les statuts de facture sans les interpréter ;
+  les données de démonstration ne contiennent ni brouillon ni facture annulée.
+- MCP : les réponses de Claude (par exemple « doublon probable dans le même ERP ») sont des
+  déductions à partir des données renvoyées, à vérifier ; l'API du SDK `mcp` 2.3.0 n'a été
+  vérifiée que pour les fonctions utilisées.
+- Tests : les vues `reporting` et la connexion réelle à Claude Desktop sont contrôlées à la main,
+  pas par des tests automatiques ; les tests de base de données sont ignorés sans `HUB_READER_PASSWORD`.
+
 ## Prérequis
 
-Python 3.11+, Docker Desktop, Git. Power BI Desktop (Windows) pour ouvrir `powerbi/erp_hub.pbix`.
+Python 3.11+ (testé avec 3.12.9), Docker Desktop, Git. Power BI Desktop (Windows) pour ouvrir `powerbi/erp_hub.pbix`.
 
 ## Installation
 
@@ -287,7 +360,7 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Renseigner ensuite `.env` (clés API, URL de la base). Ne jamais commiter `.env`.
+Renseigner ensuite `.env` (clés API, URL de la base, `HUB_READER_PASSWORD`). Ne jamais commiter `.env`.
 `ERPNEXT_TIMEZONE` est optionnelle (`Europe/Paris` par défaut).
 
 Créer les tables et les vues des couches `raw`, `core`, `quality` et `reporting` (les scripts sont rejouables sans risque) :
@@ -299,6 +372,13 @@ Get-Content sql\003_sync_state.sql | docker exec -i hub-db psql -U hub -d hub -v
 Get-Content sql\004_core_schema.sql | docker exec -i hub-db psql -U hub -d hub -v ON_ERROR_STOP=1
 Get-Content sql\005_quality_schema.sql | docker exec -i hub-db psql -U hub -d hub -v ON_ERROR_STOP=1
 Get-Content sql\006_reporting_views.sql | docker exec -i hub-db psql -U hub -d hub -v ON_ERROR_STOP=1
+```
+
+Créer le compte de lecture seule du serveur MCP (choisir le mot de passe, le même que dans `.env`) :
+
+```powershell
+Get-Content sql\007_reader_role.sql | docker exec -i hub-db psql -U hub -d hub -v ON_ERROR_STOP=1 -v reader_password=VOTRE_MOT_DE_PASSE
+python scripts\check_reader.py          # 9 contrôles du compte hub_reader
 ```
 
 ## ERP et ports
@@ -323,6 +403,7 @@ python -m hub.build_core --rebuild       # vide core et reconstruit tout depuis 
 python -m hub.review_core                # cas douteux non fusionnés (lecture seule)
 python -m hub.run_quality                # applique les règles, met à jour quality.anomalies
 Get-Content sql\checks_sprint2.sql | docker exec -i hub-db psql -U hub -d hub   # contrôles en lecture seule
+python -m hub.mcp_server                 # serveur MCP (lancé par le client MCP, pas à la main)
 python -m pytest -q                      # tests (certains nécessitent la base hub)
 ```
 
@@ -345,6 +426,10 @@ les variables `.env` sont absentes est ignoré.
 - `sql/005_quality_schema.sql` : schéma `quality`
 - `sql/006_reporting_views.sql` : vues `reporting` pour Power BI
 - `powerbi/erp_hub.pbix` : rapport Power BI (modèle en étoile, pages Anomalies et Factures)
+- `hub/read_api.py` : requêtes de lecture sur `reporting` (compte `hub_reader`)
+- `hub/mcp_server.py` : serveur MCP, 4 outils en lecture seule
+- `sql/007_reader_role.sql` : compte `hub_reader` en lecture seule
+- `scripts/check_reader.py` : 9 contrôles du compte de lecture seule
 - `sql/checks_sprint2.sql` : contrôles de la couche `raw` (lecture seule)
 - `scripts/` : explorations et vérifications en lecture seule
 - `tests/` : tests unitaires et d'intégration

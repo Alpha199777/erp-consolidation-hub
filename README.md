@@ -16,7 +16,7 @@ interrogeables par Claude via un serveur MCP.
 | 2 | Factures, articles, synchronisation incrémentale, adresses ERPNext | Terminé (voir limites) |
 | 3 | Couche `core` : rapprochement des clients entre ERP | Terminé (voir limites) |
 | 4 | Couche `quality` : règles de contrôle et anomalies | Terminé (voir limites) |
-| 5 | Rapport Power BI | À faire |
+| 5 | Rapport Power BI : modèle en étoile et page anomalies | Terminé (voir limites) |
 | 6 | Serveur MCP | À faire |
 
 ## Architecture
@@ -29,6 +29,8 @@ interrogeables par Claude via un serveur MCP.
   quelle règle). Voir « Rapprochement des clients ».
 - `quality` : anomalies détectées. `quality.anomalies` (une ligne par anomalie, avec sa
   gravité, son statut et ses dates). Voir « Contrôle qualité ».
+- `reporting` : vues en lecture seule pour Power BI (`dim_customer`, `fact_invoice`, `dim_date`,
+  `anomalies`). Voir « Rapport Power BI ».
 
 Chaque connecteur (`hub/connectors/`) respecte le même contrat :
 `ping()`, `fetch_customers(since=None)` / `normalize()`,
@@ -115,6 +117,32 @@ Cycle de vie (`hub/run_quality.py`, fonction pure `plan_sync`, écriture en une 
 | `open` ou `accepted` qui disparaît | passe en `fixed`, `resolved_at` renseigné |
 | `accepted` | posé à la main par `UPDATE` pour ignorer une anomalie connue |
 
+## Rapport Power BI (sprint 5)
+
+Principe : les jointures et les règles métier restent en SQL, où elles se testent. Power BI ne
+lit que le schéma `reporting`, jamais `raw`, `core` ou `quality` directement.
+
+Vues (`sql/006_reporting_views.sql`) :
+
+| Vue | Contenu |
+|---|---|
+| `reporting.dim_customer` | un client unifié par ligne, avec le nombre d'ERP et la liste des ERP où il existe |
+| `reporting.fact_invoice` | une facture par ligne, rattachée au client unifié par `core.customer_links` (`customer_id` vide si aucun rattachement) |
+| `reporting.dim_date` | calendrier en années complètes autour des dates de factures |
+| `reporting.anomalies` | `quality.anomalies` avec un rang de gravité |
+
+`fact_invoice` garde les montants de l'ERP tels quels et ajoute `signed_total_excl_tax` :
+négatif quand `doc_type = 'credit_note'`. Aucun montant n'est converti d'une devise à l'autre.
+
+Fichier : `powerbi/erp_hub.pbix` (mode Importer, serveur `localhost:5433`, base `hub`).
+Modèle : `dim_customer` 1 à plusieurs `fact_invoice` sur `customer_id`, `dim_date` 1 à plusieurs
+`fact_invoice` sur `invoice_date`, filtre à sens unique. `anomalies` n'a pas de relation : elle
+décrit des entités de plusieurs types. Le fichier contient une copie des données de démonstration ;
+pour la mettre à jour, utiliser Actualiser dans Power BI.
+
+Page « Anomalies » : nombre d'anomalies ouvertes, anomalies ouvertes par règle, tableau de détail
+avec statut. Page « Factures » : chiffre d'affaires net par devise (CHF, EUR).
+
 ## Résultats du sprint 1 (mesuré en local)
 
 - 36 clients chargés : 8 Odoo, 25 Dolibarr, 3 ERPNext.
@@ -180,6 +208,21 @@ trouvés dans des données réelles.
   en `fixed` avec `resolved_at` renseigné.
 - 313 tests pytest.
 
+## Résultats du sprint 5 (mesuré en local, 14 octobre 2026)
+
+- 4 vues dans le schéma `reporting`. Contrôles SQL : 20 factures dans `raw.invoices` et 20 dans
+  `reporting.fact_invoice`, 0 clé en double, 0 facture sans client unifié ; 38 clients dans
+  `core.customers` et dans `reporting.dim_customer`.
+- Valeurs réelles des factures : Dolibarr 6 en EUR, ERPNext 5 en CHF, Odoo 9 en CHF
+  (4 `invoice`, 5 `credit_note`). Seul Odoo a des avoirs.
+- Rapprochement avec SQL : la page « Anomalies » affiche 18 anomalies ouvertes (17
+  `customer_missing_email`, 1 `lookalike_customers`), plus 1 `cross_erp_mismatch` en `fixed` dans
+  le tableau (19 lignes au total). La page « Factures » affiche 363 000 CHF et 122,24 EUR de
+  chiffre d'affaires net, identiques aux sommes SQL. Chez Odoo, factures et avoirs valent chacun
+  124 500 CHF : le net est nul, particularité des données de démonstration.
+- Aucun nouveau test pytest (313 au total) : les vues sont contrôlées par des requêtes SQL
+  lancées à la main, pas par des tests automatiques.
+
 ## Limites connues
 
 - Les suppressions ne sont pas détectées : un enregistrement supprimé dans un ERP reste
@@ -221,9 +264,19 @@ trouvés dans des données réelles.
 - Qualité : `core` ne contient que les clients ; les factures ne sont pas encore rattachées
   à un client unifié.
 
+- Power BI : le rapport est minimal (deux pages, trois mesures). Les cartes de la page « Factures »
+  affichent encore le format par défaut de Power BI (par exemple « 363,000K ») ; les valeurs sont
+  justes.
+- Power BI : le mode Importer fige une copie des données ; il n'y a pas d'actualisation planifiée.
+  La connexion à la base locale n'est pas chiffrée (acceptable en local, pas ailleurs).
+- Power BI : le chiffre d'affaires additionne tous les statuts de facture (`Overdue`, `Paid`,
+  `posted`, brouillons éventuels) sans les interpréter. Seul `invoice_date` est relié au calendrier,
+  pas `due_date`. `signed_total_excl_tax` n'est vérifié que pour Odoo : Dolibarr et ERPNext n'ont
+  aucun avoir dans les données. Aucune conversion CHF/EUR.
+
 ## Prérequis
 
-Python 3.11+, Docker Desktop, Git.
+Python 3.11+, Docker Desktop, Git. Power BI Desktop (Windows) pour ouvrir `powerbi/erp_hub.pbix`.
 
 ## Installation
 
@@ -237,7 +290,7 @@ copy .env.example .env
 Renseigner ensuite `.env` (clés API, URL de la base). Ne jamais commiter `.env`.
 `ERPNEXT_TIMEZONE` est optionnelle (`Europe/Paris` par défaut).
 
-Créer les tables des couches `raw`, `core` et `quality` (les scripts sont rejouables sans risque) :
+Créer les tables et les vues des couches `raw`, `core`, `quality` et `reporting` (les scripts sont rejouables sans risque) :
 
 ```powershell
 Get-Content sql\001_raw_schema.sql | docker exec -i hub-db psql -U hub -d hub -v ON_ERROR_STOP=1
@@ -245,6 +298,7 @@ Get-Content sql\002_raw_invoices_items.sql | docker exec -i hub-db psql -U hub -
 Get-Content sql\003_sync_state.sql | docker exec -i hub-db psql -U hub -d hub -v ON_ERROR_STOP=1
 Get-Content sql\004_core_schema.sql | docker exec -i hub-db psql -U hub -d hub -v ON_ERROR_STOP=1
 Get-Content sql\005_quality_schema.sql | docker exec -i hub-db psql -U hub -d hub -v ON_ERROR_STOP=1
+Get-Content sql\006_reporting_views.sql | docker exec -i hub-db psql -U hub -d hub -v ON_ERROR_STOP=1
 ```
 
 ## ERP et ports
@@ -289,6 +343,8 @@ les variables `.env` sont absentes est ignoré.
 - `sql/001_raw_schema.sql`, `sql/002_raw_invoices_items.sql`, `sql/003_sync_state.sql` : schéma `raw`
 - `sql/004_core_schema.sql` : schéma `core`
 - `sql/005_quality_schema.sql` : schéma `quality`
+- `sql/006_reporting_views.sql` : vues `reporting` pour Power BI
+- `powerbi/erp_hub.pbix` : rapport Power BI (modèle en étoile, pages Anomalies et Factures)
 - `sql/checks_sprint2.sql` : contrôles de la couche `raw` (lecture seule)
 - `scripts/` : explorations et vérifications en lecture seule
 - `tests/` : tests unitaires et d'intégration

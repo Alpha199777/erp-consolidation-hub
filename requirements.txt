@@ -3,3 +3,4 @@ psycopg[binary]
 python-dotenv
 pytest
 tzdata
+mcp==2.3.0

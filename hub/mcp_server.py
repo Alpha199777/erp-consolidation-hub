@@ -5,10 +5,18 @@ Lancement : python -m hub.mcp_server   (transport stdio : le client MCP demarre 
 IMPORTANT : en stdio, la sortie standard (stdout) est le canal du protocole. Ne jamais y
 ecrire avec print() ; les messages de diagnostic vont sur stderr.
 """
+from pathlib import Path
+
+from dotenv import load_dotenv
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from hub import read_api
+
+# Le client MCP lance ce processus depuis un dossier quelconque : on charge donc le .env
+# du projet par son chemin, pas par le dossier courant.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
 
 INSTRUCTIONS = (
     "Donnees du projet ERP Consolidation Hub : clients et factures de trois ERP (Odoo, "
